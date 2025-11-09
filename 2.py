@@ -39,6 +39,8 @@ INTERVAL_SECONDS = {
     '1d': 24 * 60 * 60,
 }
 
+MOMENTUM_LOOKBACK_MINUTES = 15 * 50  # 确保至少50根K线以计算动量指标
+
 # ==================== Roostoo 客户端 ====================
 class RoostooClient:
     def __init__(self, api_key: str = None, secret_key: str = None):
@@ -232,6 +234,8 @@ class MarketAnalyzer:
         results = {}
         for symbol, prices in price_series.items():
             df = pd.DataFrame({'price': prices})
+            df['close'] = df['price']
+            df['volume'] = df['price'].pct_change().abs().fillna(0) * 1000.0
             df['returns'] = df['price'].pct_change()
             df['ma_5'] = df['price'].rolling(5).mean()
             df['ma_10'] = df['price'].rolling(10).mean()
@@ -276,32 +280,138 @@ class TradingStrategy:
         self.last_account_value = None
         self.trade_history = []
 
-    def generate_signals(self, analysis: dict) -> dict:
+    def generate_signals(self, analysis: dict, fear_greed: str) -> dict:
         signals = {}
-        for pair, df in analysis.items():
-            latest = df.iloc[-1]
-            signal = {'pair': pair, 'price': latest['price'], 'action': 'hold', 'size': 0.0, 'reason': []}
+        risk_multiplier = self._risk_multiplier_from_fng(fear_greed)
 
-            if latest.get('emergency_sell', False):
-                signal.update({'action': 'sell', 'size': 1.0})
-                signal['price'] *= (1 - EMERGENCY_SELL_DISCOUNT)
-                signal['reason'].append("紧急抛售")
-            elif pair in MAINSTREAM_COINS:
-                if latest.get('grid_buy') or latest.get('reversion_buy'):
-                    signal.update({'action': 'buy', 'size': 0.05})
-                    signal['reason'].append("主流币买入信号")
-                elif latest.get('grid_sell'):
-                    signal.update({'action': 'sell', 'size': 0.05})
-                    signal['reason'].append("主流币卖出信号")
+        for pair, df in analysis.items():
+            if df.empty:
+                signals[pair] = {
+                    'pair': pair,
+                    'price': None,
+                    'action': 'hold',
+                    'size': 0.0,
+                    'reason': ['数据不足，保持观望'],
+                    'fear_greed': fear_greed,
+                }
+                continue
+
+            latest = df.iloc[-1]
+            reference_price = float(latest.get('close', latest.get('price', 0.0)))
+            signal = {
+                'pair': pair,
+                'price': reference_price,
+                'action': 'hold',
+                'size': 0.0,
+                'reason': [],
+                'fear_greed': fear_greed,
+            }
+
+            if 'close' not in df.columns:
+                signal['reason'].append('缺少 close 数据，保持观望')
+                signals[pair] = signal
+                continue
+
+            momentum_df = df[['close']].copy()
+            if 'volume' in df.columns:
+                momentum_df['volume'] = df['volume']
+
+            long_signal, short_signal = self.momentum_signal(momentum_df)
+
+            if long_signal and not short_signal:
+                buy_size = min(max(0.01, 0.05 * risk_multiplier), 0.3)
+                signal.update({'action': 'buy', 'size': buy_size})
+                signal['reason'].append(f"动量做多信号 (F&G: {fear_greed})")
+            elif short_signal and not long_signal:
+                sell_size = min(max(0.05, 0.25 / max(risk_multiplier, 0.5)), 1.0)
+                signal.update({'action': 'sell', 'size': sell_size})
+                signal['reason'].append(f"动量做空信号 (F&G: {fear_greed})")
             else:
-                if latest['whale_signal'] > 0:
-                    signal.update({'action': 'buy', 'size': 0.02})
-                    signal['reason'].append("跟随鲸鱼买入")
-                elif latest['price'] < latest['ma_5']:
-                    signal.update({'action': 'sell', 'size': 0.25})
-                    signal['reason'].append("破5线减仓")
+                signal['reason'].append("动量指标无操作信号")
+
             signals[pair] = signal
+
         return signals
+
+    def momentum_signal(self, data: pd.DataFrame):
+        if 'close' not in data.columns:
+            return False, False
+
+        close = data['close'].dropna()
+        if close.shape[0] < 50:
+            return False, False
+
+        rsi = pd.Series(talib.RSI(close.values, timeperiod=14), index=close.index)
+        macd, macd_signal, _ = talib.MACD(close.values, fastperiod=12, slowperiod=26, signalperiod=9)
+        macd = pd.Series(macd, index=close.index)
+        macd_signal = pd.Series(macd_signal, index=close.index)
+        sma_20 = pd.Series(talib.SMA(close.values, timeperiod=20), index=close.index)
+        sma_50 = pd.Series(talib.SMA(close.values, timeperiod=50), index=close.index)
+
+        volume_filter_long = True
+        volume_filter_short = True
+        if 'volume' in data.columns:
+            volume = data['volume'].reindex(close.index)
+            if volume.notna().sum() >= 20:
+                volume = volume.fillna(method='ffill').fillna(0)
+                volume_sma_vals = talib.SMA(volume.values, timeperiod=20)
+                volume_sma = pd.Series(volume_sma_vals, index=close.index)
+                vol_sma_last = volume_sma.iloc[-1]
+                current_volume = volume.iloc[-1]
+                if not np.isnan(vol_sma_last) and vol_sma_last > 0:
+                    volume_filter_long = current_volume > vol_sma_last * 1.5
+                    volume_filter_short = current_volume > vol_sma_last * 1.5
+
+        rsi_last = rsi.iloc[-1]
+        macd_last = macd.iloc[-1]
+        macd_signal_last = macd_signal.iloc[-1]
+        sma20_last = sma_20.iloc[-1]
+        sma50_last = sma_50.iloc[-1]
+        price_last = close.iloc[-1]
+
+        if any(np.isnan(val) for val in [rsi_last, macd_last, macd_signal_last, sma20_last, sma50_last, price_last]):
+            return False, False
+
+        long_signal = (
+            50 < rsi_last < 70 and
+            macd_last > macd_signal_last and
+            price_last > sma20_last and
+            sma20_last > sma50_last and
+            volume_filter_long
+        )
+
+        short_signal = (
+            30 < rsi_last < 50 and
+            macd_last < macd_signal_last and
+            price_last < sma20_last and
+            sma20_last < sma50_last and
+            volume_filter_short
+        )
+
+        return long_signal, short_signal
+
+    def _risk_multiplier_from_fng(self, classification: str) -> float:
+        if not classification:
+            return 1.0
+        normalized = classification.strip().lower()
+        mapping = {
+            'extreme greed': 1.3,
+            'greed': 1.1,
+            'neutral': 1.0,
+            'fear': 0.85,
+            'extreme fear': 0.7,
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+
+        zh_mapping = {
+            '极度贪婪': 1.3,
+            '贪婪': 1.1,
+            '中性': 1.0,
+            '恐惧': 0.85,
+            '极度恐惧': 0.7,
+        }
+        return zh_mapping.get(classification.strip(), 1.0)
 
     def execute(self, signals: dict):
         if self.usd_balance is None:
@@ -313,11 +423,17 @@ class TradingStrategy:
 
         for pair, sig in signals.items():
             if sig['action'] == 'hold' or sig['size'] <= 0:
-                print(f"{pair} | HOLD | 原因: {', '.join(sig.get('reason', ['信号保持']))}")
+                reasons = ", ".join(sig.get('reason', ['信号保持']))
+                print(f"{pair} | HOLD | 原因: {reasons}")
                 continue
 
-            price = self.client.get_ticker(pair) or sig['price']
-            if price is None or price <= 0:
+            ticker_price = self.client.get_ticker(pair)
+            price_candidate = ticker_price if ticker_price is not None else sig['price']
+            try:
+                price = float(price_candidate)
+            except (TypeError, ValueError):
+                price = float('nan')
+            if not np.isfinite(price) or price <= 0:
                 print(f"跳过 {pair}: 无有效价格")
                 continue
 
@@ -372,7 +488,17 @@ class TradingStrategy:
                 roi = (account_value - self.last_account_value) / self.last_account_value
             self.last_account_value = account_value
 
-            self._record_trade(pair, action, qty, price, trade_value, account_value, roi, sig.get('reason', []))
+            self._record_trade(
+                pair,
+                action,
+                qty,
+                price,
+                trade_value,
+                account_value,
+                roi,
+                sig.get('reason', []),
+                sig.get('fear_greed'),
+            )
 
     def _compute_account_value(self, market_prices: dict) -> float:
         total = self.usd_balance
@@ -389,7 +515,7 @@ class TradingStrategy:
         return total
 
     def _record_trade(self, pair: str, action: str, qty: float, price: float, trade_value: float,
-                      account_value: float, roi: float, reasons: list):
+                      account_value: float, roi: float, reasons: list, fear_greed: str = None):
         trade_info = {
             'timestamp': datetime.utcnow().isoformat(),
             'pair': pair,
@@ -400,26 +526,29 @@ class TradingStrategy:
             'account_value': account_value,
             'roi': roi,
             'reasons': reasons,
+            'fear_greed': fear_greed,
         }
         self.trade_history.append(trade_info)
+        fg_text = f" | F&G: {fear_greed}" if fear_greed else ""
         print(
-            f"{pair} | {action.upper()} {qty:.6f} @ {price:.2f} | 账户净值: {account_value:.2f} USD | 单次ROI: {roi:.4%}"
+            f"{pair} | {action.upper()} {qty:.6f} @ {price:.2f} | 账户净值: {account_value:.2f} USD | 单次ROI: {roi:.4%}{fg_text}"
         )
 
 # ==================== 系统主循环 ====================
 def run_once():
     print(f"\n{'='*60}")
-    print(f"Horus量化交易系统运行 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"3q1 quant trading bot executing - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     horus = HorusDataClient(HORUS_API_KEY)
     roostoo = RoostooClient()
     analyzer = MarketAnalyzer()
     strategy = TradingStrategy(roostoo)
-    price_data = horus.fetch_price_series(ALL_SYMBOLS, minutes=15)
+    price_data = horus.fetch_price_series(ALL_SYMBOLS, minutes=MOMENTUM_LOOKBACK_MINUTES, interval='15m')
     analysis = analyzer.analyze(price_data)
-    signals = strategy.generate_signals(analysis)
+    fear_greed = horus.fetch_fear_greed_index()
+    signals = strategy.generate_signals(analysis, fear_greed)
     strategy.execute(signals)
-    print("恐惧贪婪指数:", horus.fetch_fear_greed_index())
+    print("恐惧贪婪指数:", fear_greed)
 
 def periodic_task():
     while not stop_event.is_set():
@@ -430,7 +559,7 @@ def periodic_task():
         stop_event.wait(60)  # 改这里！60秒=每分钟执行一次 → 改成3600秒=每小时
 
 if __name__ == "__main__":
-    print("Horus 实盘量化交易系统启动（默认每分钟执行一次）")
+    print("3q1 quant trading bot launching...")
     print("按 Ctrl+C 停止")
     thread = Thread(target=periodic_task, daemon=True)
     thread.start()
