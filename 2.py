@@ -1,45 +1,43 @@
-# horus_quant_trading_system.py
-# ✅ 实时交易版：Horus真实接口，无稳定币逻辑
-# 支持：主流币均值回归/网格 + 山寨币鲸鱼策略
-# 数据更新周期15min，默认交易频率1min（可改1h）
-
-import pandas as pd
-import numpy as np
-import requests
-import time
 import os
+import time
+import requests
+import pandas as pd
 import hmac
 import hashlib
 from datetime import datetime
-from typing import Dict, List
-import warnings
 from threading import Thread, Event
 import talib
+from dotenv import load_dotenv
+import warnings
+import numpy as np
+import math
 
 warnings.filterwarnings('ignore')
 
 # ==================== 加载环境变量 ====================
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    print("提示: pip install python-dotenv 可自动加载 .env 文件")
+load_dotenv()
+HORUS_API_KEY = os.getenv('HORUS_API_KEY') or "78732c7f065ebee7e63c0b313628cc3a95e0e805ae6e237f59e445c69e3a1d8d"
 
 # ==================== 全局配置 ====================
 TRANSACTION_FEE = 0.001
 EMERGENCY_DROP_THRESHOLD = 0.15
 EMERGENCY_SELL_DISCOUNT = 0.05
 
-# 前15大市值币种（可根据实际更新）
 ALL_SYMBOLS = [
     'BTC/USD', 'ETH/USD', 'BNB/USD', 'SOL/USD', 'XRP/USD',
     'ADA/USD', 'DOGE/USD', 'TRX/USD', 'AVAX/USD', 'LINK/USD',
-    'DOT/USD', 'TON/USD', 'MATIC/USD', 'LTC/USD', 'BCH/USD'
+    'DOT/USD', 'TON/USD', 'LTC/USD', 'BCH/USD'
 ]
 MAINSTREAM_COINS = ['BTC/USD', 'ETH/USD', 'BNB/USD', 'SOL/USD', 'XRP/USD']
 ALT_COINS = [s for s in ALL_SYMBOLS if s not in MAINSTREAM_COINS]
 
 stop_event = Event()
+
+INTERVAL_SECONDS = {
+    '15m': 15 * 60,
+    '1h': 60 * 60,
+    '1d': 24 * 60 * 60,
+}
 
 # ==================== Roostoo 客户端 ====================
 class RoostooClient:
@@ -47,6 +45,7 @@ class RoostooClient:
         self.api_key = api_key or os.getenv('ROOSTOO_API_KEY')
         self.secret_key = secret_key or os.getenv('ROOSTOO_SECRET_KEY')
         self.base_url = "https://mock-api.roostoo.com"
+        self.session = requests.Session()
 
     def _get_timestamp(self):
         return str(int(time.time() * 1000))
@@ -67,7 +66,7 @@ class RoostooClient:
         url = f"{self.base_url}/v3/balance"
         headers, payload, _ = self._get_signed_headers({})
         try:
-            r = requests.get(url, headers=headers, params=payload, timeout=10)
+            r = self.session.get(url, headers=headers, params=payload, timeout=10)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -80,7 +79,7 @@ class RoostooClient:
         payload = {'symbol': pair.replace('/', '')}
         headers, _, _ = self._get_signed_headers(payload)
         try:
-            r = requests.get(url, headers=headers, params=payload, timeout=10)
+            r = self.session.get(url, headers=headers, params=payload, timeout=10)
             r.raise_for_status()
             data = r.json()
             return float(data.get('price', 0.0))
@@ -96,7 +95,7 @@ class RoostooClient:
         headers, _, total_params = self._get_signed_headers(payload)
         headers['Content-Type'] = 'application/x-www-form-urlencoded'
         try:
-            r = requests.post(url, headers=headers, data=total_params, timeout=10)
+            r = self.session.post(url, headers=headers, data=total_params, timeout=10)
             r.raise_for_status()
             print(f"手续费0.1%已扣除 | 下单成功: {side} {quantity:.6f} {pair} @ {price or '市价'}")
             return r.json()
@@ -109,34 +108,115 @@ class HorusDataClient:
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.getenv('HORUS_API_KEY')
         self.base_url = "https://api-horus.com"
+        self.session = requests.Session()
 
-    def fetch_price_series(self, symbols: List[str], minutes: int = 15) -> Dict[str, pd.Series]:
+    def _parse_json_to_dataframe(self, data, sym: str) -> pd.DataFrame:
+        """
+        通用 JSON 解析函数，支持多种 API 返回格式：
+        1. 列表格式: [{"timestamp": ..., "price": ...}, ...]
+        2. 对象包含数组: {"data": [...], "prices": [...]} 
+        3. 嵌套结构: {"result": {"BTC": [...]}}
+        """
+        if isinstance(data, list):
+            # 格式1: 直接是数组
+            if len(data) == 0:
+                return None
+            return pd.DataFrame(data)
+        
+        elif isinstance(data, dict):
+            # 格式2/3: 字典 - 需要找到包含数据的键
+            
+            # 尝试常见的数据键名
+            for key in ['data', 'prices', 'result', 'records', 'items', 'values']:
+                if key in data:
+                    nested = data[key]
+                    if isinstance(nested, list) and len(nested) > 0:
+                        return pd.DataFrame(nested)
+                    elif isinstance(nested, dict):
+                        # 如果是嵌套字典，尝试提取该币种的数据
+                        clean_sym = sym.split('/')[0]  # 'BTC/USD' -> 'BTC'
+                        if clean_sym in nested:
+                            sym_data = nested[clean_sym]
+                            if isinstance(sym_data, list):
+                                return pd.DataFrame(sym_data)
+                            elif isinstance(sym_data, dict):
+                                return pd.DataFrame([sym_data])
+            
+            # 如果上述都没找到，尝试把整个字典当作一行数据
+            return pd.DataFrame([data])
+        
+        return None
+
+    def fetch_price_series(self, symbols: list, minutes: int = 15, interval: str = '15m') -> dict:
         """从 Horus 的 /market/price 获取价格时间序列"""
         data_dict = {}
-        end_ts = int(time.time())
-        start_ts = end_ts - minutes * 60
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        interval_seconds = INTERVAL_SECONDS.get(interval)
+        if interval_seconds is None:
+            raise ValueError(f"Unsupported interval: {interval}")
+
+        now = int(time.time())
+        # 将 end_ts 对齐至最近的完整 K 线结束时间（end 为独占区间）
+        end_ts = (now // interval_seconds) * interval_seconds
+
+        window_seconds = max(minutes * 60, interval_seconds)
+        num_intervals = max(1, math.ceil(window_seconds / interval_seconds))
+        start_ts = end_ts - num_intervals * interval_seconds
+
+        headers = {"X-API-KEY": self.api_key}
 
         for sym in symbols:
+            clean_symbol = sym.replace('/USD', '')
             url = f"{self.base_url}/market/price"
             params = {
-                "assest": sym,
-                "interval": "15m",
+                "asset": clean_symbol,
+                "interval": interval,
                 "start": start_ts,
                 "end": end_ts,
                 "format": "json"
             }
             try:
-                r = requests.get(url, headers=headers, params=params, timeout=10)
+                r = self.session.get(url, headers=headers, params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
-                # 假设返回 [{"timestamp": 1731090000, "price": 70000.5}, ...]
-                df = pd.DataFrame(data)
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+                # 检查数据格式
+                if not data:
+                    print(f"Horus 获取 {sym} 失败: 返回数据为空")
+                    continue
+
+                # 使用通用解析函数
+                df = self._parse_json_to_dataframe(data, sym)
+
+                if df is None or df.empty:
+                    print(f"Horus 获取 {sym} 失败: 无法解析数据结构。原始数据: {type(data).__name__}")
+                    continue
+
+                # 检查必需列是否存在
+                if 'timestamp' not in df.columns:
+                    print(f"Horus 获取 {sym} 失败: 返回数据中没有 'timestamp' 列。可用列: {list(df.columns)}")
+                    continue
+                
+                if 'price' not in df.columns:
+                    print(f"Horus 获取 {sym} 失败: 返回数据中没有 'price' 列。可用列: {list(df.columns)}")
+                    continue
+                
+                # 处理 timestamp（可能是秒级或毫秒级）
+                try:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+                except:
+                    try:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    except:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                
                 df.set_index('timestamp', inplace=True)
                 data_dict[sym] = df['price'].astype(float)
+            except requests.exceptions.RequestException as e:
+                print(f"Horus 获取 {sym} 失败 (网络错误): {e}")
+            except KeyError as e:
+                print(f"Horus 获取 {sym} 失败 (缺少字段): {e}")
             except Exception as e:
-                print(f"Horus 获取 {sym} 失败: {e}")
+                print(f"Horus 获取 {sym} 失败 (未知错误): {type(e).__name__}: {e}")
+        
         return data_dict
 
     def fetch_fear_greed_index(self):
@@ -148,7 +228,7 @@ class HorusDataClient:
 
 # ==================== 市场分析器 ====================
 class MarketAnalyzer:
-    def analyze(self, price_series: Dict[str, pd.Series]) -> Dict[str, pd.DataFrame]:
+    def analyze(self, price_series: dict) -> dict:
         results = {}
         for symbol, prices in price_series.items():
             df = pd.DataFrame({'price': prices})
@@ -191,8 +271,12 @@ class MarketAnalyzer:
 class TradingStrategy:
     def __init__(self, roostoo_client: RoostooClient):
         self.client = roostoo_client
+        self.usd_balance = None
+        self.positions = {}
+        self.last_account_value = None
+        self.trade_history = []
 
-    def generate_signals(self, analysis: Dict[str, pd.DataFrame]) -> Dict[str, Dict]:
+    def generate_signals(self, analysis: dict) -> dict:
         signals = {}
         for pair, df in analysis.items():
             latest = df.iloc[-1]
@@ -219,22 +303,115 @@ class TradingStrategy:
             signals[pair] = signal
         return signals
 
-    def execute(self, signals: Dict[str, Dict]):
-        balance = self.client.get_balance()
-        usd = float(balance.get('available_USD', 50000))
+    def execute(self, signals: dict):
+        if self.usd_balance is None:
+            balance = self.client.get_balance()
+            self.usd_balance = float(balance.get('available_USD', 50000))
+            self.last_account_value = self.usd_balance
+
+        market_prices = {}
+
         for pair, sig in signals.items():
-            if sig['action'] == 'hold' or sig['size'] == 0:
+            if sig['action'] == 'hold' or sig['size'] <= 0:
+                print(f"{pair} | HOLD | 原因: {', '.join(sig.get('reason', ['信号保持']))}")
                 continue
+
             price = self.client.get_ticker(pair) or sig['price']
-            qty = (usd * sig['size']) / price * (1 - TRANSACTION_FEE)
-            self.client.place_order(pair, sig['action'], qty, price=price)
+            if price is None or price <= 0:
+                print(f"跳过 {pair}: 无有效价格")
+                continue
+
+            market_prices[pair] = price
+            action = sig['action']
+            size = sig['size']
+
+            if action == 'buy':
+                usd_to_use = self.usd_balance * min(size, 1.0)
+                if usd_to_use <= 0:
+                    continue
+                qty = usd_to_use / price
+                estimated_cost = qty * price * (1 + TRANSACTION_FEE)
+                if estimated_cost > self.usd_balance:
+                    qty = (self.usd_balance / (1 + TRANSACTION_FEE)) / price
+                    estimated_cost = qty * price * (1 + TRANSACTION_FEE)
+                if qty <= 0:
+                    continue
+                response = self.client.place_order(pair, action, qty, price=price)
+                if not response:
+                    continue
+                self.usd_balance -= estimated_cost
+                self.positions[pair] = self.positions.get(pair, 0.0) + qty
+                trade_value = -estimated_cost
+
+            elif action == 'sell':
+                held_qty = self.positions.get(pair, 0.0)
+                if held_qty <= 0:
+                    print(f"跳过 {pair}: 无持仓可卖出")
+                    continue
+                qty = held_qty * min(size, 1.0)
+                if qty <= 0:
+                    continue
+                response = self.client.place_order(pair, action, qty, price=price)
+                if not response:
+                    continue
+                proceeds = qty * price * (1 - TRANSACTION_FEE)
+                self.usd_balance += proceeds
+                remaining = held_qty - qty
+                if remaining <= 0:
+                    self.positions.pop(pair, None)
+                else:
+                    self.positions[pair] = remaining
+                trade_value = proceeds
+
+            else:
+                continue
+
+            account_value = self._compute_account_value(market_prices)
+            roi = 0.0
+            if self.last_account_value and self.last_account_value > 0:
+                roi = (account_value - self.last_account_value) / self.last_account_value
+            self.last_account_value = account_value
+
+            self._record_trade(pair, action, qty, price, trade_value, account_value, roi, sig.get('reason', []))
+
+    def _compute_account_value(self, market_prices: dict) -> float:
+        total = self.usd_balance
+        for pair, qty in self.positions.items():
+            if qty <= 0:
+                continue
+            price = market_prices.get(pair)
+            if price is None:
+                price = self.client.get_ticker(pair)
+                if price is None or price <= 0:
+                    continue
+                market_prices[pair] = price
+            total += qty * price
+        return total
+
+    def _record_trade(self, pair: str, action: str, qty: float, price: float, trade_value: float,
+                      account_value: float, roi: float, reasons: list):
+        trade_info = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'pair': pair,
+            'action': action,
+            'quantity': qty,
+            'price': price,
+            'trade_value': trade_value,
+            'account_value': account_value,
+            'roi': roi,
+            'reasons': reasons,
+        }
+        self.trade_history.append(trade_info)
+        print(
+            f"{pair} | {action.upper()} {qty:.6f} @ {price:.2f} | 账户净值: {account_value:.2f} USD | 单次ROI: {roi:.4%}"
+        )
 
 # ==================== 系统主循环 ====================
 def run_once():
     print(f"\n{'='*60}")
     print(f"Horus量化交易系统运行 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
-    horus = HorusDataClient()
+    horus = HorusDataClient(HORUS_API_KEY)
     roostoo = RoostooClient()
     analyzer = MarketAnalyzer()
     strategy = TradingStrategy(roostoo)
