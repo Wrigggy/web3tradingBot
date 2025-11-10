@@ -14,12 +14,24 @@ import math
 
 warnings.filterwarnings('ignore')
 
-def _read_env_var(name: str, required: bool = False):
+# 默认内置的 API 凭证，可通过环境变量覆盖
+DEFAULT_HORUS_API_KEY = "78732c7f065ebee7e63c0b313628cc3a95e0e805ae6e237f59e445c69e3a1d8d"
+DEFAULT_ROOSTOO_API_KEY = "R9w8LnUa9O9cXjdggFlhP2mbblSiCSoxfPnLE6VUR1mQZUgsqgMYiuNyHUU1pwK5"
+DEFAULT_ROOSTOO_SECRET_KEY = "cJASSuT7pMmyc2Cx9vYMOl0nO8VnxlaxYFxJjmDKMs7ZqEpfcI09wyIhTJbpHce1"
+
+
+def _read_env_var(name: str, default: str = None, required: bool = False):
     value = os.getenv(name)
     if value is None or not value.strip():
+        if default is not None and default.strip():
+            if value is None:
+                print(f"环境变量 {name} 未设置，使用内置默认值。")
+            else:
+                print(f"环境变量 {name} 为空，使用内置默认值。")
+            return default.strip()
         if required:
             raise RuntimeError(
-                f"环境变量 {name} 未设置。请在 config.py 中填写并通过 start.sh 导出后重试。"
+                f"环境变量 {name} 未设置，且无默认值可用。请设置后重试。"
             )
         return None
     return value.strip()
@@ -41,9 +53,9 @@ def _load_poll_interval(default_seconds: int = 3600) -> int:
 
 # ==================== 加载环境变量 ====================
 load_dotenv()
-HORUS_API_KEY = _read_env_var('HORUS_API_KEY', required=True)
-ROOSTOO_API_KEY = _read_env_var('ROOSTOO_API_KEY', required=True)
-ROOSTOO_SECRET_KEY = _read_env_var('ROOSTOO_SECRET_KEY', required=True)
+HORUS_API_KEY = _read_env_var('HORUS_API_KEY', default=DEFAULT_HORUS_API_KEY, required=True)
+ROOSTOO_API_KEY = _read_env_var('ROOSTOO_API_KEY', default=DEFAULT_ROOSTOO_API_KEY, required=True)
+ROOSTOO_SECRET_KEY = _read_env_var('ROOSTOO_SECRET_KEY', default=DEFAULT_ROOSTOO_SECRET_KEY, required=True)
 POLL_INTERVAL_SECONDS = _load_poll_interval()
 
 # ==================== 全局配置 ====================
