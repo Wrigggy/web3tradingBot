@@ -7,57 +7,17 @@ import hashlib
 from datetime import datetime
 from threading import Thread, Event
 import talib
-from dotenv import load_dotenv
 import warnings
 import numpy as np
 import math
 
 warnings.filterwarnings('ignore')
 
-# 默认内置的 API 凭证，可通过环境变量覆盖
-DEFAULT_HORUS_API_KEY = "78732c7f065ebee7e63c0b313628cc3a95e0e805ae6e237f59e445c69e3a1d8d"
-DEFAULT_ROOSTOO_API_KEY = "R9w8LnUa9O9cXjdggFlhP2mbblSiCSoxfPnLE6VUR1mQZUgsqgMYiuNyHUU1pwK5"
-DEFAULT_ROOSTOO_SECRET_KEY = "cJASSuT7pMmyc2Cx9vYMOl0nO8VnxlaxYFxJjmDKMs7ZqEpfcI09wyIhTJbpHce1"
-
-
-def _read_env_var(name: str, default: str = None, required: bool = False):
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        if default is not None and default.strip():
-            if value is None:
-                print(f"环境变量 {name} 未设置，使用内置默认值。")
-            else:
-                print(f"环境变量 {name} 为空，使用内置默认值。")
-            return default.strip()
-        if required:
-            raise RuntimeError(
-                f"环境变量 {name} 未设置，且无默认值可用。请设置后重试。"
-            )
-        return None
-    return value.strip()
-
-
-def _load_poll_interval(default_seconds: int = 60) -> int:
-    raw_value = os.getenv('POLL_INTERVAL_SECONDS')
-    if raw_value is None or not raw_value.strip():
-        return default_seconds
-    try:
-        interval = int(float(raw_value))
-        if interval <= 0:
-            raise ValueError
-        return interval
-    except ValueError:
-        print(f"POLL_INTERVAL_SECONDS={raw_value} 无效，使用默认值 {default_seconds} 秒")
-        return default_seconds
-
-
-# ==================== 加载环境变量 ====================
-load_dotenv()
-HORUS_API_KEY = _read_env_var('HORUS_API_KEY', default=DEFAULT_HORUS_API_KEY, required=True)
-ROOSTOO_API_KEY = _read_env_var('ROOSTOO_API_KEY', default=DEFAULT_ROOSTOO_API_KEY, required=True)
-ROOSTOO_SECRET_KEY = _read_env_var('ROOSTOO_SECRET_KEY', default=DEFAULT_ROOSTOO_SECRET_KEY, required=True)
-POLL_INTERVAL_SECONDS = _load_poll_interval()
-
+# ==================== API 凭证（内置常量，可按需修改） ====================
+# 如需在部署环境中覆盖，请直接编辑此处的值。
+HORUS_API_KEY = "78732c7f065ebee7e63c0b313628cc3a95e0e805ae6e237f59e445c69e3a1d8d"
+ROOSTOO_API_KEY = "R9w8LnUa9O9cXjdggFlhP2mbblSiCSoxfPnLE6VUR1mQZUgsqgMYiuNyHUU1pwK5"
+ROOSTOO_SECRET_KEY = "cJASSuT7pMmyc2Cx9vYMOl0nO8VnxlaxYFxJjmDKMs7ZqEpfcI09wyIhTJbpHce1"
 # ==================== 全局配置 ====================
 TRANSACTION_FEE = 0.001
 EMERGENCY_DROP_THRESHOLD = 0.15
@@ -78,8 +38,6 @@ INTERVAL_SECONDS = {
     '1h': 60 * 60,
     '1d': 24 * 60 * 60,
 }
-
-MOMENTUM_LOOKBACK_MINUTES = 15 * 50  # 确保至少50根K线以计算动量指标
 
 # ==================== Roostoo 客户端 ====================
 class RoostooClient:
@@ -274,8 +232,6 @@ class MarketAnalyzer:
         results = {}
         for symbol, prices in price_series.items():
             df = pd.DataFrame({'price': prices})
-            df['close'] = df['price']
-            df['volume'] = df['price'].pct_change().abs().fillna(0) * 1000.0
             df['returns'] = df['price'].pct_change()
             df['ma_5'] = df['price'].rolling(5).mean()
             df['ma_10'] = df['price'].rolling(10).mean()
@@ -320,147 +276,32 @@ class TradingStrategy:
         self.last_account_value = None
         self.trade_history = []
 
-    def generate_signals(self, analysis: dict, fear_greed: str) -> dict:
+    def generate_signals(self, analysis: dict) -> dict:
         signals = {}
-        risk_multiplier = self._risk_multiplier_from_fng(fear_greed)
-
         for pair, df in analysis.items():
-            if df.empty:
-                signals[pair] = {
-                    'pair': pair,
-                    'price': None,
-                    'action': 'hold',
-                    'size': 0.0,
-                    'reason': ['数据不足，保持观望'],
-                    'fear_greed': fear_greed,
-                }
-                continue
-
             latest = df.iloc[-1]
-            reference_price = float(latest.get('close', latest.get('price', 0.0)))
-            signal = {
-                'pair': pair,
-                'price': reference_price,
-                'action': 'hold',
-                'size': 0.0,
-                'reason': [],
-                'fear_greed': fear_greed,
-            }
+            signal = {'pair': pair, 'price': latest['price'], 'action': 'hold', 'size': 0.0, 'reason': []}
 
-            if 'close' not in df.columns:
-                signal['reason'].append('缺少 close 数据，保持观望')
-                signals[pair] = signal
-                continue
-
-            close_only = df[['close']].copy()
-            mean_rev_long, mean_rev_short = self.mean_reversion_signal(close_only)
-            turtle_long, turtle_short = self.turtle_signal(close_only)
-
-            long_reasons = []
-            short_reasons = []
-
-            if mean_rev_long:
-                long_reasons.append("均值回归下轨反弹信号")
-            if turtle_long:
-                long_reasons.append("海龟通道突破做多")
-            if mean_rev_short:
-                short_reasons.append("均值回归上轨回落信号")
-            if turtle_short:
-                short_reasons.append("海龟通道跌破做空")
-
-            if long_reasons and not short_reasons:
-                buy_size = min(max(0.02, 0.05 * risk_multiplier), 0.35)
-                signal.update({'action': 'buy', 'size': buy_size})
-                signal['reason'].extend(long_reasons)
-                signal['reason'].append(f"F&G: {fear_greed}")
-            elif short_reasons and not long_reasons:
-                sell_size = min(max(0.05, 0.3 / max(risk_multiplier, 0.5)), 1.0)
-                signal.update({'action': 'sell', 'size': sell_size})
-                signal['reason'].extend(short_reasons)
-                signal['reason'].append(f"F&G: {fear_greed}")
+            if latest.get('emergency_sell', False):
+                signal.update({'action': 'sell', 'size': 1.0})
+                signal['price'] *= (1 - EMERGENCY_SELL_DISCOUNT)
+                signal['reason'].append("紧急抛售")
+            elif pair in MAINSTREAM_COINS:
+                if latest.get('grid_buy') or latest.get('reversion_buy'):
+                    signal.update({'action': 'buy', 'size': 0.05})
+                    signal['reason'].append("主流币买入信号")
+                elif latest.get('grid_sell'):
+                    signal.update({'action': 'sell', 'size': 0.05})
+                    signal['reason'].append("主流币卖出信号")
             else:
-                signal['reason'].append("策略无明确方向")
-
+                if latest['whale_signal'] > 0:
+                    signal.update({'action': 'buy', 'size': 0.02})
+                    signal['reason'].append("跟随鲸鱼买入")
+                elif latest['price'] < latest['ma_5']:
+                    signal.update({'action': 'sell', 'size': 0.25})
+                    signal['reason'].append("破5线减仓")
             signals[pair] = signal
-
         return signals
-
-    def mean_reversion_signal(self, data: pd.DataFrame):
-        close = data['close'].dropna()
-        if close.shape[0] < 20:
-            return False, False
-
-        upper, middle, lower = talib.BBANDS(close.values, timeperiod=20, nbdevup=2, nbdevdn=2)
-        current_price = close.iloc[-1]
-        upper_last, middle_last, lower_last = upper[-1], middle[-1], lower[-1]
-
-        if any(np.isnan(val) for val in [upper_last, middle_last, lower_last, current_price]):
-            return False, False
-
-        band_width = upper_last - lower_last
-        if band_width <= 0:
-            return False, False
-
-        bb_position = (current_price - lower_last) / band_width
-
-        long_signal = bb_position < 0.1
-        short_signal = bb_position > 0.9
-
-        rsi = talib.RSI(close.values, timeperiod=14)
-        rsi_last = rsi[-1]
-        if np.isnan(rsi_last):
-            rsi_last = 50.0
-
-        if long_signal and rsi_last > 30:
-            long_signal = False
-        if short_signal and rsi_last < 70:
-            short_signal = False
-
-        return long_signal, short_signal
-
-    def turtle_signal(self, data: pd.DataFrame):
-        close = data['close'].dropna()
-        if close.shape[0] < 55:
-            return False, False
-
-        breakout_window = 20
-        channel_high = close.rolling(window=breakout_window).max().shift(1)
-        channel_low = close.rolling(window=breakout_window).min().shift(1)
-
-        upper_break = channel_high.iloc[-1]
-        lower_break = channel_low.iloc[-1]
-        price_last = close.iloc[-1]
-
-        if any(np.isnan(val) for val in [upper_break, lower_break, price_last]):
-            return False, False
-
-        long_signal = price_last > upper_break
-        short_signal = price_last < lower_break
-
-        return long_signal, short_signal
-
-    def _risk_multiplier_from_fng(self, classification: str) -> float:
-        if not classification:
-            return 1.0
-        normalized = classification.strip().lower()
-        mapping = {
-            'extreme greed': 1.3,
-            'greed': 1.1,
-            'neutral': 1.0,
-            'fear': 0.85,
-            'extreme fear': 0.7,
-        }
-        if normalized in mapping:
-            return mapping[normalized]
-
-        zh_mapping = {
-            '极度贪婪': 1.3,
-            '贪婪': 1.1,
-            '中性': 1.0,
-            '恐惧': 0.85,
-            '极度恐惧': 0.7,
-        }
-        return zh_mapping.get(classification.strip(), 1.0)
 
     def execute(self, signals: dict):
         if self.usd_balance is None:
@@ -472,17 +313,11 @@ class TradingStrategy:
 
         for pair, sig in signals.items():
             if sig['action'] == 'hold' or sig['size'] <= 0:
-                reasons = ", ".join(sig.get('reason', ['信号保持']))
-                print(f"{pair} | HOLD | 原因: {reasons}")
+                print(f"{pair} | HOLD | 原因: {', '.join(sig.get('reason', ['信号保持']))}")
                 continue
 
-            ticker_price = self.client.get_ticker(pair)
-            price_candidate = ticker_price if ticker_price is not None else sig['price']
-            try:
-                price = float(price_candidate)
-            except (TypeError, ValueError):
-                price = float('nan')
-            if not np.isfinite(price) or price <= 0:
+            price = self.client.get_ticker(pair) or sig['price']
+            if price is None or price <= 0:
                 print(f"跳过 {pair}: 无有效价格")
                 continue
 
@@ -537,17 +372,7 @@ class TradingStrategy:
                 roi = (account_value - self.last_account_value) / self.last_account_value
             self.last_account_value = account_value
 
-            self._record_trade(
-                pair,
-                action,
-                qty,
-                price,
-                trade_value,
-                account_value,
-                roi,
-                sig.get('reason', []),
-                sig.get('fear_greed'),
-            )
+            self._record_trade(pair, action, qty, price, trade_value, account_value, roi, sig.get('reason', []))
 
     def _compute_account_value(self, market_prices: dict) -> float:
         total = self.usd_balance
@@ -564,7 +389,7 @@ class TradingStrategy:
         return total
 
     def _record_trade(self, pair: str, action: str, qty: float, price: float, trade_value: float,
-                      account_value: float, roi: float, reasons: list, fear_greed: str = None):
+                      account_value: float, roi: float, reasons: list):
         trade_info = {
             'timestamp': datetime.utcnow().isoformat(),
             'pair': pair,
@@ -575,93 +400,22 @@ class TradingStrategy:
             'account_value': account_value,
             'roi': roi,
             'reasons': reasons,
-            'fear_greed': fear_greed,
         }
         self.trade_history.append(trade_info)
-        fg_text = f" | F&G: {fear_greed}" if fear_greed else ""
         print(
-            f"{pair} | {action.upper()} {qty:.6f} @ {price:.2f} | 账户净值: {account_value:.2f} USD | 单次ROI: {roi:.4%}{fg_text}"
+            f"{pair} | {action.upper()} {qty:.6f} @ {price:.2f} | 账户净值: {account_value:.2f} USD | 单次ROI: {roi:.4%}"
         )
 
-# ==================== 系统主循环 ====================
-def run_once(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy):
-    print(f"\n{'='*60}")
-    print(f"3q1 quant trading bot executing - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}")
-    price_data = horus.fetch_price_series(ALL_SYMBOLS, minutes=MOMENTUM_LOOKBACK_MINUTES, interval='15m')
-    analysis = analyzer.analyze(price_data)
-    fear_greed = horus.fetch_fear_greed_index()
-    signals = strategy.generate_signals(analysis, fear_greed)
-    strategy.execute(signals)
-    report_portfolio(strategy)
-    print("恐惧贪婪指数:", fear_greed)
-
-def periodic_task(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy, poll_interval: int):
-    while not stop_event.is_set():
-        try:
-            run_once(horus, analyzer, strategy)
-        except Exception as e:
-            print("运行异常:", e)
-        if stop_event.wait(poll_interval):
-            break
-
-
-def initialize_positions(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy):
-    print("\n开始初始化建仓...")
-    if strategy.usd_balance is None:
-        balance_info = strategy.client.get_balance()
-        strategy.usd_balance = float(balance_info.get('available_USD', 50000))
-        strategy.last_account_value = strategy.usd_balance
-
-    cash_available = strategy.usd_balance
-    if cash_available <= 0:
-        print("初始化建仓: 现金余额为零，跳过建仓。")
-        return
-
-    allocation = cash_available * 0.10
-    if allocation <= 0:
-        print("初始化建仓: 可用资金不足，跳过建仓。")
-        return
-
-    per_coin = allocation / len(MAINSTREAM_COINS)
-    executed = 0
-
-    for pair in MAINSTREAM_COINS:
-        price = strategy.client.get_ticker(pair)
-        if price is None or price <= 0:
-            print(f"初始化建仓: {pair} 没有有效价格，跳过。")
-            continue
-
-        usd_to_use = min(per_coin, strategy.usd_balance)
-        if usd_to_use <= 0:
-            break
-
-        qty = usd_to_use / price
-        if qty <= 0:
-            continue
-
-        response = strategy.client.place_order(pair, 'buy', qty, price=price)
-        if not response:
-            continue
-
-        cost = qty * price * (1 + TRANSACTION_FEE)
-        strategy.usd_balance -= cost
-        strategy.positions[pair] = strategy.positions.get(pair, 0.0) + qty
-        executed += 1
-        print(f"初始化建仓: 买入 {qty:.6f} {pair}，耗资 {cost:.2f} USD")
-
-    if executed == 0:
-        print("初始化建仓: 未能完成主流币买入。")
-    else:
-        print(f"初始化建仓: 已完成 {executed} 个主流币建仓。")
-    report_portfolio(strategy)
-
-
+# ==================== 组合展示 ====================
 def report_portfolio(strategy: TradingStrategy):
-    cash_balance = strategy.usd_balance or 0.0
+    if strategy.usd_balance is None:
+        print("当前账户净值: 数据不足，尚未获取账户信息。")
+        return
+
+    cash_balance = strategy.usd_balance
     positions = strategy.positions or {}
-    position_values = []
     total_positions_value = 0.0
+    details = []
 
     for pair, qty in positions.items():
         if qty <= 0:
@@ -672,38 +426,53 @@ def report_portfolio(strategy: TradingStrategy):
             continue
         value = qty * price
         total_positions_value += value
-        position_values.append((pair, qty, price, value))
+        details.append((pair, qty, price, value))
 
     account_value = cash_balance + total_positions_value
-
     print(f"当前账户净值: {account_value:.2f} USD")
 
-    if not position_values:
+    if not details:
         cash_pct = (cash_balance / account_value * 100) if account_value > 0 else 0.0
         print(f"现金余额: {cash_balance:.2f} USD ({cash_pct:.2f}%)")
         return
 
-    for pair, qty, price, value in position_values:
+    for pair, qty, price, value in details:
         pct = (value / account_value * 100) if account_value > 0 else 0.0
         print(f"{pair}: {qty:.6f} 手 | 市值 {value:.2f} USD ({pct:.2f}%)")
 
     cash_pct = (cash_balance / account_value * 100) if account_value > 0 else 0.0
     print(f"现金余额: {cash_balance:.2f} USD ({cash_pct:.2f}%)")
 
+
+# ==================== 系统主循环 ====================
+def run_once(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy):
+    print(f"\n{'='*60}")
+    print(f"3q1 quant trading system executing - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+    price_data = horus.fetch_price_series(ALL_SYMBOLS, minutes=15)
+    analysis = analyzer.analyze(price_data)
+    signals = strategy.generate_signals(analysis)
+    strategy.execute(signals)
+    report_portfolio(strategy)
+    print("恐惧贪婪指数:", horus.fetch_fear_greed_index())
+
+
+def periodic_task(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy):
+    while not stop_event.is_set():
+        try:
+            run_once(horus, analyzer, strategy)
+        except Exception as e:
+            print("运行异常:", e)
+        stop_event.wait(60)  # 每60秒运行一次
+
 if __name__ == "__main__":
-    print("3q1 quant trading bot launching...")
+    print("3q1 quant trading system launching")
     print("按 Ctrl+C 停止")
     horus_client = HorusDataClient(HORUS_API_KEY)
     roostoo_client = RoostooClient(ROOSTOO_API_KEY, ROOSTOO_SECRET_KEY)
     analyzer = MarketAnalyzer()
     strategy = TradingStrategy(roostoo_client)
-    print(f"轮询间隔: {POLL_INTERVAL_SECONDS} 秒")
-    initialize_positions(horus_client, analyzer, strategy)
-    thread = Thread(
-        target=periodic_task,
-        args=(horus_client, analyzer, strategy, POLL_INTERVAL_SECONDS),
-        daemon=True,
-    )
+    thread = Thread(target=periodic_task, args=(horus_client, analyzer, strategy), daemon=True)
     thread.start()
     try:
         while True:
