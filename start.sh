@@ -16,15 +16,19 @@ pip install -r requirements.txt
 
 read_config_var() {
   local var_name="$1"
-  python3 - <<'PYCODE'
+  python3 - "$var_name" <<'PYCODE'
 import importlib
 import sys
 
 module = importlib.import_module("config")
-value = getattr(module, sys.argv[1], None)
-if value is None or not str(value).strip():
+var_name = sys.argv[1]
+value = getattr(module, var_name, None)
+if value is None:
     sys.exit(1)
-print(str(value).strip())
+value_str = str(value).strip()
+if not value_str:
+    sys.exit(1)
+print(value_str)
 PYCODE
 }
 
