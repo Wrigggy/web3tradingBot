@@ -16,12 +16,20 @@ pip install -r requirements.txt
 
 read_config_var() {
   local var_name="$1"
-  python3 - "$var_name" <<'PYCODE'
+  CONFIG_QUERY="$var_name" python3 - <<'PYCODE'
 import importlib
 import sys
+import os
 
-module = importlib.import_module("config")
-var_name = sys.argv[1]
+var_name = os.environ.get("CONFIG_QUERY")
+if not var_name:
+  sys.exit(1)
+
+try:
+  module = importlib.import_module("config")
+except ModuleNotFoundError:
+  sys.exit(1)
+
 value = getattr(module, var_name, None)
 if value is None:
     sys.exit(1)
