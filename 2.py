@@ -14,9 +14,37 @@ import math
 
 warnings.filterwarnings('ignore')
 
+def _read_env_var(name: str, required: bool = False):
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        if required:
+            raise RuntimeError(
+                f"环境变量 {name} 未设置。请在 config.py 中填写并通过 start.sh 导出后重试。"
+            )
+        return None
+    return value.strip()
+
+
+def _load_poll_interval(default_seconds: int = 3600) -> int:
+    raw_value = os.getenv('POLL_INTERVAL_SECONDS')
+    if raw_value is None or not raw_value.strip():
+        return default_seconds
+    try:
+        interval = int(float(raw_value))
+        if interval <= 0:
+            raise ValueError
+        return interval
+    except ValueError:
+        print(f"POLL_INTERVAL_SECONDS={raw_value} 无效，使用默认值 {default_seconds} 秒")
+        return default_seconds
+
+
 # ==================== 加载环境变量 ====================
 load_dotenv()
-HORUS_API_KEY = os.getenv('HORUS_API_KEY')  
+HORUS_API_KEY = _read_env_var('HORUS_API_KEY', required=True)
+ROOSTOO_API_KEY = _read_env_var('ROOSTOO_API_KEY', required=True)
+ROOSTOO_SECRET_KEY = _read_env_var('ROOSTOO_SECRET_KEY', required=True)
+POLL_INTERVAL_SECONDS = _load_poll_interval()
 
 # ==================== 全局配置 ====================
 TRANSACTION_FEE = 0.001
@@ -44,8 +72,8 @@ MOMENTUM_LOOKBACK_MINUTES = 15 * 50  # 确保至少50根K线以计算动量指�
 # ==================== Roostoo 客户端 ====================
 class RoostooClient:
     def __init__(self, api_key: str = None, secret_key: str = None):
-        self.api_key = api_key or os.getenv('ROOSTOO_API_KEY')
-        self.secret_key = secret_key or os.getenv('ROOSTOO_SECRET_KEY')
+        self.api_key = api_key or ROOSTOO_API_KEY
+        self.secret_key = secret_key or ROOSTOO_SECRET_KEY
         self.base_url = "https://mock-api.roostoo.com"
         self.session = requests.Session()
 
@@ -108,7 +136,7 @@ class RoostooClient:
 # ==================== Horus 数据客户端 ====================
 class HorusDataClient:
     def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv('HORUS_API_KEY')
+        self.api_key = api_key or HORUS_API_KEY
         self.base_url = "https://api-horus.com"
         self.session = requests.Session()
 
@@ -535,14 +563,10 @@ class TradingStrategy:
         )
 
 # ==================== 系统主循环 ====================
-def run_once():
+def run_once(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy):
     print(f"\n{'='*60}")
     print(f"3q1 quant trading bot executing - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
-    horus = HorusDataClient(HORUS_API_KEY)
-    roostoo = RoostooClient()
-    analyzer = MarketAnalyzer()
-    strategy = TradingStrategy(roostoo)
     price_data = horus.fetch_price_series(ALL_SYMBOLS, minutes=MOMENTUM_LOOKBACK_MINUTES, interval='15m')
     analysis = analyzer.analyze(price_data)
     fear_greed = horus.fetch_fear_greed_index()
@@ -550,18 +574,28 @@ def run_once():
     strategy.execute(signals)
     print("恐惧贪婪指数:", fear_greed)
 
-def periodic_task():
+def periodic_task(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy, poll_interval: int):
     while not stop_event.is_set():
         try:
-            run_once()
+            run_once(horus, analyzer, strategy)
         except Exception as e:
             print("运行异常:", e)
-        stop_event.wait(60)  # 改这里！60秒=每分钟执行一次 → 改成3600秒=每小时
+        if stop_event.wait(poll_interval):
+            break
 
 if __name__ == "__main__":
     print("3q1 quant trading bot launching...")
     print("按 Ctrl+C 停止")
-    thread = Thread(target=periodic_task, daemon=True)
+    horus_client = HorusDataClient(HORUS_API_KEY)
+    roostoo_client = RoostooClient(ROOSTOO_API_KEY, ROOSTOO_SECRET_KEY)
+    analyzer = MarketAnalyzer()
+    strategy = TradingStrategy(roostoo_client)
+    print(f"轮询间隔: {POLL_INTERVAL_SECONDS} 秒")
+    thread = Thread(
+        target=periodic_task,
+        args=(horus_client, analyzer, strategy, POLL_INTERVAL_SECONDS),
+        daemon=True,
+    )
     thread.start()
     try:
         while True:
