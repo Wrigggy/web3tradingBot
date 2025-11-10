@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 
 # ==================== 加载环境变量 ====================
 load_dotenv()
-HORUS_API_KEY = os.getenv('HORUS_API_KEY') or "78732c7f065ebee7e63c0b313628cc3a95e0e805ae6e237f59e445c69e3a1d8d"
+HORUS_API_KEY = os.getenv('HORUS_API_KEY')  
 
 # ==================== 全局配置 ====================
 TRANSACTION_FEE = 0.001
