@@ -463,7 +463,7 @@ def periodic_task(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: Tr
             run_once(horus, analyzer, strategy)
         except Exception as e:
             print("运行异常:", e)
-        stop_event.wait(60)  # 每60秒运行一次
+        stop_event.wait(300)  # 每60秒运行一次
 
 if __name__ == "__main__":
     print("3q1 quant trading system launching")
