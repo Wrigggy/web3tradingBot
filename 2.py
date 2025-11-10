@@ -37,7 +37,7 @@ def _read_env_var(name: str, default: str = None, required: bool = False):
     return value.strip()
 
 
-def _load_poll_interval(default_seconds: int = 3600) -> int:
+def _load_poll_interval(default_seconds: int = 60) -> int:
     raw_value = os.getenv('POLL_INTERVAL_SECONDS')
     if raw_value is None or not raw_value.strip():
         return default_seconds
@@ -322,8 +322,6 @@ class TradingStrategy:
 
     def generate_signals(self, analysis: dict, fear_greed: str) -> dict:
         signals = {}
-        risk_multiplier = self._risk_multiplier_from_fng(fear_greed)
-
         for pair, df in analysis.items():
             if df.empty:
                 signals[pair] = {
@@ -337,121 +335,38 @@ class TradingStrategy:
                 continue
 
             latest = df.iloc[-1]
-            reference_price = float(latest.get('close', latest.get('price', 0.0)))
             signal = {
                 'pair': pair,
-                'price': reference_price,
+                'price': float(latest.get('close', latest.get('price', 0.0))),
                 'action': 'hold',
                 'size': 0.0,
                 'reason': [],
                 'fear_greed': fear_greed,
             }
 
-            if 'close' not in df.columns:
-                signal['reason'].append('缺少 close 数据，保持观望')
-                signals[pair] = signal
-                continue
-
-            momentum_df = df[['close']].copy()
-            if 'volume' in df.columns:
-                momentum_df['volume'] = df['volume']
-
-            long_signal, short_signal = self.momentum_signal(momentum_df)
-
-            if long_signal and not short_signal:
-                buy_size = min(max(0.01, 0.05 * risk_multiplier), 0.3)
-                signal.update({'action': 'buy', 'size': buy_size})
-                signal['reason'].append(f"动量做多信号 (F&G: {fear_greed})")
-            elif short_signal and not long_signal:
-                sell_size = min(max(0.05, 0.25 / max(risk_multiplier, 0.5)), 1.0)
-                signal.update({'action': 'sell', 'size': sell_size})
-                signal['reason'].append(f"动量做空信号 (F&G: {fear_greed})")
+            if latest.get('emergency_sell', False):
+                signal.update({'action': 'sell', 'size': 1.0})
+                signal['price'] *= (1 - EMERGENCY_SELL_DISCOUNT)
+                signal['reason'].append("紧急抛售")
+            elif pair in MAINSTREAM_COINS:
+                if latest.get('grid_buy') or latest.get('reversion_buy'):
+                    signal.update({'action': 'buy', 'size': 0.05})
+                    signal['reason'].append("主流币买入信号")
+                elif latest.get('grid_sell'):
+                    signal.update({'action': 'sell', 'size': 0.05})
+                    signal['reason'].append("主流币卖出信号")
             else:
-                signal['reason'].append("动量指标无操作信号")
+                whale_signal = latest.get('whale_signal', 0)
+                if whale_signal > 0:
+                    signal.update({'action': 'buy', 'size': 0.02})
+                    signal['reason'].append("跟随鲸鱼买入")
+                elif latest.get('price', 0.0) < latest.get('ma_5', latest.get('price', 0.0)):
+                    signal.update({'action': 'sell', 'size': 0.25})
+                    signal['reason'].append("破5线减仓")
 
             signals[pair] = signal
 
         return signals
-
-    def momentum_signal(self, data: pd.DataFrame):
-        if 'close' not in data.columns:
-            return False, False
-
-        close = data['close'].dropna()
-        if close.shape[0] < 50:
-            return False, False
-
-        rsi = pd.Series(talib.RSI(close.values, timeperiod=14), index=close.index)
-        macd, macd_signal, _ = talib.MACD(close.values, fastperiod=12, slowperiod=26, signalperiod=9)
-        macd = pd.Series(macd, index=close.index)
-        macd_signal = pd.Series(macd_signal, index=close.index)
-        sma_20 = pd.Series(talib.SMA(close.values, timeperiod=20), index=close.index)
-        sma_50 = pd.Series(talib.SMA(close.values, timeperiod=50), index=close.index)
-
-        volume_filter_long = True
-        volume_filter_short = True
-        if 'volume' in data.columns:
-            volume = data['volume'].reindex(close.index)
-            if volume.notna().sum() >= 20:
-                volume = volume.fillna(method='ffill').fillna(0)
-                volume_sma_vals = talib.SMA(volume.values, timeperiod=20)
-                volume_sma = pd.Series(volume_sma_vals, index=close.index)
-                vol_sma_last = volume_sma.iloc[-1]
-                current_volume = volume.iloc[-1]
-                if not np.isnan(vol_sma_last) and vol_sma_last > 0:
-                    volume_filter_long = current_volume > vol_sma_last * 1.5
-                    volume_filter_short = current_volume > vol_sma_last * 1.5
-
-        rsi_last = rsi.iloc[-1]
-        macd_last = macd.iloc[-1]
-        macd_signal_last = macd_signal.iloc[-1]
-        sma20_last = sma_20.iloc[-1]
-        sma50_last = sma_50.iloc[-1]
-        price_last = close.iloc[-1]
-
-        if any(np.isnan(val) for val in [rsi_last, macd_last, macd_signal_last, sma20_last, sma50_last, price_last]):
-            return False, False
-
-        long_signal = (
-            50 < rsi_last < 70 and
-            macd_last > macd_signal_last and
-            price_last > sma20_last and
-            sma20_last > sma50_last and
-            volume_filter_long
-        )
-
-        short_signal = (
-            30 < rsi_last < 50 and
-            macd_last < macd_signal_last and
-            price_last < sma20_last and
-            sma20_last < sma50_last and
-            volume_filter_short
-        )
-
-        return long_signal, short_signal
-
-    def _risk_multiplier_from_fng(self, classification: str) -> float:
-        if not classification:
-            return 1.0
-        normalized = classification.strip().lower()
-        mapping = {
-            'extreme greed': 1.3,
-            'greed': 1.1,
-            'neutral': 1.0,
-            'fear': 0.85,
-            'extreme fear': 0.7,
-        }
-        if normalized in mapping:
-            return mapping[normalized]
-
-        zh_mapping = {
-            '极度贪婪': 1.3,
-            '贪婪': 1.1,
-            '中性': 1.0,
-            '恐惧': 0.85,
-            '极度恐惧': 0.7,
-        }
-        return zh_mapping.get(classification.strip(), 1.0)
 
     def execute(self, signals: dict):
         if self.usd_balance is None:
@@ -461,84 +376,14 @@ class TradingStrategy:
 
         market_prices = {}
 
+        processed_pairs = set()
+        if self._positions_are_flat():
+            processed_pairs = self._build_initial_positions(signals, market_prices)
+
         for pair, sig in signals.items():
-            if sig['action'] == 'hold' or sig['size'] <= 0:
-                reasons = ", ".join(sig.get('reason', ['信号保持']))
-                print(f"{pair} | HOLD | 原因: {reasons}")
+            if pair in processed_pairs:
                 continue
-
-            ticker_price = self.client.get_ticker(pair)
-            price_candidate = ticker_price if ticker_price is not None else sig['price']
-            try:
-                price = float(price_candidate)
-            except (TypeError, ValueError):
-                price = float('nan')
-            if not np.isfinite(price) or price <= 0:
-                print(f"跳过 {pair}: 无有效价格")
-                continue
-
-            market_prices[pair] = price
-            action = sig['action']
-            size = sig['size']
-
-            if action == 'buy':
-                usd_to_use = self.usd_balance * min(size, 1.0)
-                if usd_to_use <= 0:
-                    continue
-                qty = usd_to_use / price
-                estimated_cost = qty * price * (1 + TRANSACTION_FEE)
-                if estimated_cost > self.usd_balance:
-                    qty = (self.usd_balance / (1 + TRANSACTION_FEE)) / price
-                    estimated_cost = qty * price * (1 + TRANSACTION_FEE)
-                if qty <= 0:
-                    continue
-                response = self.client.place_order(pair, action, qty, price=price)
-                if not response:
-                    continue
-                self.usd_balance -= estimated_cost
-                self.positions[pair] = self.positions.get(pair, 0.0) + qty
-                trade_value = -estimated_cost
-
-            elif action == 'sell':
-                held_qty = self.positions.get(pair, 0.0)
-                if held_qty <= 0:
-                    print(f"跳过 {pair}: 无持仓可卖出")
-                    continue
-                qty = held_qty * min(size, 1.0)
-                if qty <= 0:
-                    continue
-                response = self.client.place_order(pair, action, qty, price=price)
-                if not response:
-                    continue
-                proceeds = qty * price * (1 - TRANSACTION_FEE)
-                self.usd_balance += proceeds
-                remaining = held_qty - qty
-                if remaining <= 0:
-                    self.positions.pop(pair, None)
-                else:
-                    self.positions[pair] = remaining
-                trade_value = proceeds
-
-            else:
-                continue
-
-            account_value = self._compute_account_value(market_prices)
-            roi = 0.0
-            if self.last_account_value and self.last_account_value > 0:
-                roi = (account_value - self.last_account_value) / self.last_account_value
-            self.last_account_value = account_value
-
-            self._record_trade(
-                pair,
-                action,
-                qty,
-                price,
-                trade_value,
-                account_value,
-                roi,
-                sig.get('reason', []),
-                sig.get('fear_greed'),
-            )
+            self._process_signal(pair, sig, market_prices)
 
     def _compute_account_value(self, market_prices: dict) -> float:
         total = self.usd_balance
@@ -573,6 +418,107 @@ class TradingStrategy:
         print(
             f"{pair} | {action.upper()} {qty:.6f} @ {price:.2f} | 账户净值: {account_value:.2f} USD | 单次ROI: {roi:.4%}{fg_text}"
         )
+
+    def _positions_are_flat(self) -> bool:
+        if not self.positions:
+            return True
+        return all(qty <= 0 for qty in self.positions.values())
+
+    def _build_initial_positions(self, signals: dict, market_prices: dict) -> set:
+        executed_pairs = set()
+        for pair, sig in signals.items():
+            if sig['action'] != 'buy' or sig['size'] <= 0:
+                continue
+            if self._process_signal(pair, sig, market_prices, suppress_hold=True):
+                executed_pairs.add(pair)
+        if not executed_pairs:
+            print("初始建仓: 未找到适合买入的信号。")
+        else:
+            print(f"初始建仓: 已执行 {len(executed_pairs)} 个买入信号。")
+        return executed_pairs
+
+    def _process_signal(self, pair: str, sig: dict, market_prices: dict, suppress_hold: bool = False) -> bool:
+        action = sig.get('action', 'hold')
+        size = sig.get('size', 0.0)
+
+        if action == 'hold' or size <= 0:
+            if not suppress_hold:
+                reasons = ", ".join(sig.get('reason', ['信号保持']))
+                print(f"{pair} | HOLD | 原因: {reasons}")
+            return False
+
+        price = self.client.get_ticker(pair) or sig.get('price')
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            price = float('nan')
+
+        if not np.isfinite(price) or price <= 0:
+            print(f"跳过 {pair}: 无有效价格")
+            return False
+
+        market_prices[pair] = price
+
+        if action == 'buy':
+            usd_to_use = self.usd_balance * min(size, 1.0)
+            if usd_to_use <= 0:
+                return False
+            qty = usd_to_use / price
+            estimated_cost = qty * price * (1 + TRANSACTION_FEE)
+            if estimated_cost > self.usd_balance:
+                qty = (self.usd_balance / (1 + TRANSACTION_FEE)) / price
+                estimated_cost = qty * price * (1 + TRANSACTION_FEE)
+            if qty <= 0:
+                return False
+            response = self.client.place_order(pair, action, qty, price=price)
+            if not response:
+                return False
+            self.usd_balance -= estimated_cost
+            self.positions[pair] = self.positions.get(pair, 0.0) + qty
+            trade_value = -estimated_cost
+
+        elif action == 'sell':
+            held_qty = self.positions.get(pair, 0.0)
+            if held_qty <= 0:
+                print(f"跳过 {pair}: 无持仓可卖出")
+                return False
+            qty = held_qty * min(size, 1.0)
+            if qty <= 0:
+                return False
+            response = self.client.place_order(pair, action, qty, price=price)
+            if not response:
+                return False
+            proceeds = qty * price * (1 - TRANSACTION_FEE)
+            self.usd_balance += proceeds
+            remaining = held_qty - qty
+            if remaining <= 0:
+                self.positions.pop(pair, None)
+            else:
+                self.positions[pair] = remaining
+            trade_value = proceeds
+
+        else:
+            return False
+
+        account_value = self._compute_account_value(market_prices)
+        roi = 0.0
+        if self.last_account_value and self.last_account_value > 0:
+            roi = (account_value - self.last_account_value) / self.last_account_value
+        self.last_account_value = account_value
+
+        self._record_trade(
+            pair,
+            action,
+            qty,
+            price,
+            trade_value,
+            account_value,
+            roi,
+            sig.get('reason', []),
+            sig.get('fear_greed'),
+        )
+
+        return True
 
 # ==================== 系统主循环 ====================
 def run_once(horus: HorusDataClient, analyzer: MarketAnalyzer, strategy: TradingStrategy):
