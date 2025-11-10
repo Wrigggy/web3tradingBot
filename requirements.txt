@@ -1,0 +1,6 @@
+# Python dependencies for the 3q1 momentum trading bot
+requests>=2.32.0
+pandas>=2.2.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+TA-Lib>=0.4.28
