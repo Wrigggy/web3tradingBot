@@ -1,4 +1,4 @@
-# Python dependencies for the 3q1 momentum trading bot
+# Python dependencies for the 3q1 right_draft trading bot
 requests>=2.32.0
 pandas>=2.2.0
 numpy>=1.26.0

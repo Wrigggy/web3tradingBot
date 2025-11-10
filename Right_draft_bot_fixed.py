@@ -16,8 +16,8 @@ warnings.filterwarnings('ignore')
 # ==================== API 凭证（内置常量，可按需修改） ====================
 # 如需在部署环境中覆盖，请直接编辑此处的值。
 HORUS_API_KEY = "78732c7f065ebee7e63c0b313628cc3a95e0e805ae6e237f59e445c69e3a1d8d"
-ROOSTOO_API_KEY = "R9w8LnUa9O9cXjdggFlhP2mbblSiCSoxfPnLE6VUR1mQZUgsqgMYiuNyHUU1pwK5"
-ROOSTOO_SECRET_KEY = "cJASSuT7pMmyc2Cx9vYMOl0nO8VnxlaxYFxJjmDKMs7ZqEpfcI09wyIhTJbpHce1"
+ROOSTOO_API_KEY = "pA6sD2fGhJ8kL4zXcV0bN5mQwE7rT3yUiO9pA1sDfG2hJ6kLxC8vB0nMqW5eR7tY"
+ROOSTOO_SECRET_KEY = "dF6gHjK8lL2ZxC4vBnM6qW8eRtY0uI2oPaS4dF6gHjK8lL1ZxCV3bN5mQwE7"
 # ==================== 全局配置 ====================
 TRANSACTION_FEE = 0.001
 EMERGENCY_DROP_THRESHOLD = 0.15
